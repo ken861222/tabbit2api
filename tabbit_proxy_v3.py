@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
-Tabbit Chat Proxy v3 — Webpack Module Injection
-=================================================
-通过 CDP 调用 Tabbit 内部 webpack 模块，动态发现 + 自动导航。
-参考: hwttop5/tabbit2api PR#2 更新的模块 ID。
+Tabbit Chat Proxy v3 — Webpack Module Injection + Tool Calling
+================================================================
+通过 CDP 调用 Tabbit 内部 webpack 模块，支持 agent tool calling。
 
 启动:  python3 tabbit_proxy_v3.py
 """
 
-import json, sys, time, uuid, threading
+import json, sys, time, uuid, threading, re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import websocket
@@ -38,6 +37,109 @@ PRIORITY_CHAIN = [
     "Claude-Opus-4.7", "GPT-5.5", "Claude-Sonnet-4.6",
     "GPT-5.4", "DeepSeek-V4-Pro", "GLM-5.1", "Gemini-3.1-Pro",
 ]
+
+# ─── Tool Calling Support ────────────────────────────────────────────────────
+
+TOOL_CALL_INSTRUCTION = """## Available Tools
+
+You have access to the following tools. To use a tool, output EXACTLY this format in your response:
+
+<tool_call>
+{"name": "tool_name", "arguments": {"arg1": "value1", "arg2": "value2"}}
+</tool_call>
+
+Rules:
+- You may include multiple <tool_call> blocks if needed
+- Tool calls must be valid JSON
+- If you don't need any tools, respond normally without tool call blocks
+- After a tool call, do NOT add any other text
+
+{tools_text}"""
+
+def format_tools_for_prompt(tools):
+    """Convert OpenAI tools format to text for system prompt."""
+    if not tools:
+        return ""
+    parts = []
+    for tool in tools:
+        func = tool.get("function", {})
+        name = func.get("name", "unknown")
+        desc = func.get("description", "")
+        params = func.get("parameters", {})
+        parts.append(f"### {name}\nDescription: {desc}")
+        if params:
+            parts.append(f"Parameters: {json.dumps(params, ensure_ascii=False)}")
+    return "\n\n".join(parts)
+
+
+def inject_tools_into_messages(messages, tools):
+    """Inject tool definitions into system message."""
+    if not tools:
+        return messages
+
+    tools_text = format_tools_for_prompt(tools)
+    instruction = TOOL_CALL_INSTRUCTION.replace("{tools_text}", tools_text)
+
+    # Find system message or create one
+    result = []
+    has_system = False
+    for msg in messages:
+        if msg.get("role") == "system":
+            has_system = True
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    p.get("text", "") if isinstance(p, dict) else str(p)
+                    for p in content
+                )
+            result.append({
+                "role": "system",
+                "content": content + "\n\n" + instruction
+            })
+        else:
+            result.append(msg)
+
+    if not has_system:
+        result.insert(0, {"role": "system", "content": instruction})
+
+    return result
+
+
+def parse_tool_calls(text):
+    """Parse tool call blocks from model response."""
+    if not text:
+        return None, text
+
+    pattern = r'<tool_call>\s*(\{.*?\})\s*</tool_call>'
+    matches = re.findall(pattern, text, re.DOTALL)
+
+    if not matches:
+        return None, text
+
+    tool_calls = []
+    for i, match in enumerate(matches):
+        try:
+            call = json.loads(match)
+            name = call.get("name", "")
+            arguments = call.get("arguments", {})
+            tool_calls.append({
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(arguments, ensure_ascii=False)
+                }
+            })
+        except json.JSONDecodeError:
+            continue
+
+    if not tool_calls:
+        return None, text
+
+    # Remove tool call blocks from text to get clean content
+    clean_text = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    return tool_calls, clean_text
+
 
 # ─── CDP Connection ──────────────────────────────────────────────────────────
 
@@ -85,7 +187,6 @@ def _ws_reader():
 
 
 def get_tabbit_page():
-    """Find a Tabbit page, preferring chat/session pages."""
     import urllib.request
     resp = urllib.request.urlopen(f"{CDP_URL}/json")
     targets = json.loads(resp.read())
@@ -93,7 +194,6 @@ def get_tabbit_page():
               and t.get("type") == "page"]
     if not tabbit:
         return None
-    # Prefer /chat/ or /session/ pages
     chat_pages = [t for t in tabbit if "/chat/" in t.get("url", "")]
     session_pages = [t for t in tabbit if "/session/" in t.get("url", "")]
     candidates = chat_pages or session_pages or tabbit
@@ -116,7 +216,6 @@ def cdp_connect():
 
 
 def ensure_chat_page():
-    """Navigate to chat page if not already there."""
     result = cdp_send("Runtime.evaluate", {
         "expression": "location.href",
         "returnByValue": True,
@@ -128,9 +227,7 @@ def ensure_chat_page():
 
     print(f"[cdp] Navigating to chat page...", flush=True)
     cdp_send("Page.navigate", {"url": CHAT_URL})
-    # Wait for page load
     time.sleep(5)
-    # Wait for webpack to be ready
     for _ in range(10):
         try:
             r = cdp_send("Runtime.evaluate", {
@@ -155,8 +252,6 @@ DISCOVER_JS = r"""
     if (!r) return JSON.stringify({error: "no_runtime"});
 
     const result = {};
-
-    // Find sendMessage: function with setMessages + onChatFinish in signature
     for (let id = 0; id < 100000; id++) {
         if (result.sendMessage) break;
         try {
@@ -173,7 +268,6 @@ DISCOVER_JS = r"""
         } catch {}
     }
 
-    // Find modes: object with ASK property
     for (let id = 0; id < 100000; id++) {
         if (result.modes) break;
         try {
@@ -348,12 +442,8 @@ def send_chat(prompt, model, timeout_s=TIMEOUT_S):
 
 # ─── HTTP Server ─────────────────────────────────────────────────────────────
 
-def sse_chunk(text, model="tabbit", stop=False):
-    d = {"id": f"chatcmpl-{uuid.uuid4().hex[:8]}", "object": "chat.completion.chunk",
-         "created": int(time.time()), "model": model,
-         "choices": [{"index": 0, "delta": {} if stop else {"content": text},
-                      "finish_reason": "stop" if stop else None}]}
-    return f"data: {json.dumps(d)}\n\n"
+def sse_chunk(data, model="tabbit", stop=False):
+    return f"data: {json.dumps(data)}\n\n"
 
 
 def build_content(messages):
@@ -361,7 +451,10 @@ def build_content(messages):
     for m in messages:
         role, content = m.get("role", ""), m.get("content", "")
         if isinstance(content, list):
-            content = " ".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+            content = " ".join(
+                p.get("text", "") if isinstance(p, dict) else str(p)
+                for p in content
+            )
         if role == "system": parts.append(f"[System]\n{content}")
         elif role == "user": parts.append(content)
         elif role == "assistant": parts.append(f"[Assistant]\n{content}")
@@ -395,7 +488,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            self._json({"status": "ok", "modules": bool(_module_info)})
+            self._json({"status": "ok", "modules": bool(_module_info), "features": ["chat", "tool_calling"]})
         elif self.path == "/v1/models":
             self._json({"object": "list", "data": [
                 {"id": k, "object": "model", "owned_by": "tabbit"} for k in MODELS
@@ -413,13 +506,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "bad request"}, 400); return
 
         messages = req.get("messages", [])
+        tools = req.get("tools", [])
+        tool_choice = req.get("tool_choice", "auto")
+
         if not messages:
             self._json({"error": "no messages"}, 400); return
+
+        # Inject tools into system prompt if present
+        if tools and tool_choice != "none":
+            messages = inject_tools_into_messages(messages, tools)
 
         content = build_content(messages)
         model = resolve_model(req.get("model", "default"))
         stream = req.get("stream", False)
-        print(f"[chat] model={model} stream={stream} msg={content[:80]}...", flush=True)
+        has_tools = bool(tools)
+        print(f"[chat] model={model} stream={stream} tools={has_tools} msg={content[:80]}...", flush=True)
 
         models_to_try = [model]
         if model in PRIORITY_CHAIN:
@@ -432,9 +533,20 @@ class Handler(BaseHTTPRequestHandler):
             elapsed = time.time() - t0
 
             if result.get("ok") and result.get("text"):
-                print(f"[chat] OK ({try_model}, {elapsed:.1f}s, {len(result['text'])}c)", flush=True)
-                if stream: self._stream(result["text"], try_model)
-                else: self._full(result["text"], try_model)
+                text = result["text"]
+                print(f"[chat] OK ({try_model}, {elapsed:.1f}s, {len(text)}c)", flush=True)
+
+                # Parse tool calls if tools were provided
+                tool_calls, clean_text = (None, text)
+                if tools and tool_choice != "none":
+                    tool_calls, clean_text = parse_tool_calls(text)
+                    if tool_calls:
+                        print(f"[chat] Parsed {len(tool_calls)} tool call(s)", flush=True)
+
+                if stream:
+                    self._stream(text, try_model, tool_calls, clean_text)
+                else:
+                    self._full(text, try_model, tool_calls, clean_text)
                 return
             last_error = result.get("detail", result.get("error", "unknown"))
             print(f"[chat] {try_model} failed: {str(last_error)[:80]}", flush=True)
@@ -442,21 +554,64 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"error": f"All failed: {last_error}"}, 500)
 
-    def _full(self, text, model):
-        self._json({"id": f"chatcmpl-{uuid.uuid4().hex[:8]}", "object": "chat.completion",
-                     "created": int(time.time()), "model": model,
-                     "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                                  "finish_reason": "stop"}],
-                     "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
+    def _full(self, text, model, tool_calls=None, clean_text=None):
+        choice = {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": clean_text if tool_calls else text,
+            },
+            "finish_reason": "tool_calls" if tool_calls else "stop",
+        }
+        if tool_calls:
+            choice["message"]["tool_calls"] = tool_calls
+            # Ensure content is null when tool_calls present (OpenAI convention)
+            if not clean_text:
+                choice["message"]["content"] = None
 
-    def _stream(self, text, model):
+        self._json({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [choice],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
+
+    def _stream(self, text, model, tool_calls=None, clean_text=None):
         self.send_response(200); self._cors()
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache"); self.end_headers()
-        for i in range(0, len(text), 20):
-            self.wfile.write(sse_chunk(text[i:i+20], model=model).encode()); self.wfile.flush()
-        self.wfile.write(sse_chunk("", model=model, stop=True).encode())
-        self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+
+        if tool_calls:
+            # Stream tool calls
+            chunk = {
+                "id": f"chatcmpl-{uuid.uuid4().hex[:8]}", "object": "chat.completion.chunk",
+                "created": int(time.time()), "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": None, "tool_calls": tool_calls}, "finish_reason": "tool_calls"}]
+            }
+            self.wfile.write(sse_chunk(chunk, model=model).encode())
+            self.wfile.flush()
+        else:
+            # Stream text in chunks
+            for i in range(0, len(text), 20):
+                chunk = {
+                    "id": f"chatcmpl-{uuid.uuid4().hex[:8]}", "object": "chat.completion.chunk",
+                    "created": int(time.time()), "model": model,
+                    "choices": [{"index": 0, "delta": {"content": text[i:i+20]}, "finish_reason": None}]
+                }
+                self.wfile.write(sse_chunk(chunk, model=model).encode())
+                self.wfile.flush()
+
+        # Final chunk with stop
+        final = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:8]}", "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        }
+        self.wfile.write(sse_chunk(final, model=model).encode())
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
 
     def log_message(self, format, *args): pass
 
@@ -468,7 +623,7 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
 def main():
     global _module_info
     print("=" * 50, flush=True)
-    print("  Tabbit Proxy v3 (Webpack Injection)", flush=True)
+    print("  Tabbit Proxy v3 (Webpack + Tool Calling)", flush=True)
     print("=" * 50, flush=True)
 
     try:
@@ -490,6 +645,7 @@ def main():
 
     server = ThreadedHTTPServer((HOST, PORT), Handler)
     print(f"\n[proxy] http://{HOST}:{PORT}", flush=True)
+    print(f"[proxy] Features: chat, tool_calling", flush=True)
     print(f"[proxy] Models: {len(MODELS)}\n", flush=True)
     try:
         server.serve_forever()

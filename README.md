@@ -170,6 +170,64 @@ curl -X POST http://127.0.0.1:9090/v1/chat/completions \
 
 Claude-Opus-4.7 → GPT-5.5 → Claude-Sonnet-4.6 → GPT-5.4 → DeepSeek-V4-Pro → GLM-5.1 → Gemini-3.1-Pro
 
+
+## Agent Tool Calling
+
+代理支持 OpenAI 兼容的 tool calling。工作原理：
+
+1. 将请求中的 `tools` 定义注入到 system prompt
+2. 让模型以 `<tool_call>` 格式输出工具调用
+3. 代理解析响应，转成 OpenAI `tool_calls` 格式返回
+
+**请求示例**：
+
+```json
+{
+  "model": "gpt-5.5",
+  "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+  "tools": [{
+    "type": "function",
+    "function": {
+      "name": "get_weather",
+      "description": "Get weather for a location",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "location": {"type": "string"}
+        },
+        "required": ["location"]
+      }
+    }
+  }]
+}
+```
+
+**响应示例**：
+
+```json
+{
+  "choices": [{
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_abc123",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{"location": "Tokyo"}"
+        }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+**注意事项**：
+- 模型响应时间较长（30-60秒），因为 Tabbit 使用的是网页版 API
+- tool calling 依赖模型遵循指令格式，不同模型效果可能不同
+- 建议设置较长的超时时间
 ## Agent 集成
 
 ### OpenCode / Codex
